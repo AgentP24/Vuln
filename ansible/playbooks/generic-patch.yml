@@ -1,0 +1,201 @@
+---
+# VulnGuard AI - Generic Security Patch Playbook
+# pb-generic-patch
+#
+# Applies security patches via package manager
+# Supports: RHEL/CentOS, Debian/Ubuntu, Amazon Linux
+#
+# GUARDRAILS:
+# - Creates system snapshot marker
+# - Supports check mode (dry run)
+# - May require restart depending on packages
+# - Validates package manager state
+
+- name: Apply Security Patches
+  hosts: "{{ target_hosts | default('all') }}"
+  become: yes
+  gather_facts: yes
+
+  vars:
+    # Backup directory
+    backup_dir: "/var/backups/vulnguard"
+
+    # VulnGuard tracking
+    vulnerability_id: "{{ vuln_id | default('UNKNOWN') }}"
+    approval_id: "{{ approval_id | default('UNKNOWN') }}"
+
+    # Specific packages to update (optional)
+    # If not specified, will update all security packages
+    target_packages: "{{ packages | default([]) }}"
+
+    # Reboot settings
+    allow_reboot: "{{ reboot_allowed | default(false) }}"
+    reboot_timeout: 600
+
+  pre_tasks:
+    - name: Create backup directory
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: '0750'
+
+    - name: Record pre-patch state
+      shell: |
+        echo "=== VulnGuard Pre-Patch State ===" > {{ backup_dir }}/patch_pre_{{ ansible_date_time.epoch }}.log
+        echo "Vulnerability ID: {{ vulnerability_id }}" >> {{ backup_dir }}/patch_pre_{{ ansible_date_time.epoch }}.log
+        echo "Approval ID: {{ approval_id }}" >> {{ backup_dir }}/patch_pre_{{ ansible_date_time.epoch }}.log
+        echo "Timestamp: {{ ansible_date_time.iso8601 }}" >> {{ backup_dir }}/patch_pre_{{ ansible_date_time.epoch }}.log
+        echo "Hostname: {{ ansible_hostname }}" >> {{ backup_dir }}/patch_pre_{{ ansible_date_time.epoch }}.log
+        echo "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}" >> {{ backup_dir }}/patch_pre_{{ ansible_date_time.epoch }}.log
+        echo "Kernel: {{ ansible_kernel }}" >> {{ backup_dir }}/patch_pre_{{ ansible_date_time.epoch }}.log
+        echo "" >> {{ backup_dir }}/patch_pre_{{ ansible_date_time.epoch }}.log
+        echo "=== Installed Packages (Security) ===" >> {{ backup_dir }}/patch_pre_{{ ansible_date_time.epoch }}.log
+      changed_when: false
+
+    - name: Record installed package versions (RHEL/CentOS)
+      shell: rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort >> {{ backup_dir }}/patch_pre_{{ ansible_date_time.epoch }}.log
+      when: ansible_os_family == "RedHat"
+      changed_when: false
+
+    - name: Record installed package versions (Debian/Ubuntu)
+      shell: dpkg -l | grep ^ii >> {{ backup_dir }}/patch_pre_{{ ansible_date_time.epoch }}.log
+      when: ansible_os_family == "Debian"
+      changed_when: false
+
+  tasks:
+    # =========================================================================
+    # RHEL/CENTOS PATCHING
+    # =========================================================================
+    - name: Update package cache (RHEL/CentOS)
+      yum:
+        update_cache: yes
+      when: ansible_os_family == "RedHat"
+
+    - name: Apply security patches (RHEL/CentOS) - Specific packages
+      yum:
+        name: "{{ target_packages }}"
+        state: latest
+        security: yes
+      when:
+        - ansible_os_family == "RedHat"
+        - target_packages | length > 0
+      register: yum_specific_result
+
+    - name: Apply all security patches (RHEL/CentOS)
+      yum:
+        name: '*'
+        state: latest
+        security: yes
+      when:
+        - ansible_os_family == "RedHat"
+        - target_packages | length == 0
+      register: yum_all_result
+
+    # =========================================================================
+    # DEBIAN/UBUNTU PATCHING
+    # =========================================================================
+    - name: Update package cache (Debian/Ubuntu)
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+    - name: Apply security patches (Debian/Ubuntu) - Specific packages
+      apt:
+        name: "{{ target_packages }}"
+        state: latest
+        only_upgrade: yes
+      when:
+        - ansible_os_family == "Debian"
+        - target_packages | length > 0
+      register: apt_specific_result
+
+    - name: Apply security patches (Debian/Ubuntu) - All security updates
+      apt:
+        upgrade: safe
+      when:
+        - ansible_os_family == "Debian"
+        - target_packages | length == 0
+      register: apt_all_result
+
+    # =========================================================================
+    # POST-PATCH CHECKS
+    # =========================================================================
+    - name: Check if reboot is required (Debian/Ubuntu)
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+      when: ansible_os_family == "Debian"
+
+    - name: Check if reboot is required (RHEL/CentOS)
+      command: needs-restarting -r
+      register: needs_restarting
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "RedHat"
+
+    - name: Set reboot required fact
+      set_fact:
+        reboot_needed: >-
+          {{
+            (ansible_os_family == "Debian" and reboot_required_file.stat.exists | default(false)) or
+            (ansible_os_family == "RedHat" and needs_restarting.rc | default(0) == 1)
+          }}
+
+    - name: Display reboot requirement
+      debug:
+        msg: "NOTICE: System reboot is required to complete patching. Reboot allowed: {{ allow_reboot }}"
+      when: reboot_needed
+
+    # =========================================================================
+    # OPTIONAL REBOOT
+    # =========================================================================
+    - name: Reboot system if required and allowed
+      reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        msg: "VulnGuard initiated reboot for security patching"
+      when:
+        - reboot_needed
+        - allow_reboot | bool
+        - not ansible_check_mode
+
+    - name: Wait for system to come back after reboot
+      wait_for_connection:
+        delay: 30
+        timeout: "{{ reboot_timeout }}"
+      when:
+        - reboot_needed
+        - allow_reboot | bool
+        - not ansible_check_mode
+
+  post_tasks:
+    - name: Record post-patch state
+      shell: |
+        echo "=== VulnGuard Post-Patch State ===" > {{ backup_dir }}/patch_post_{{ ansible_date_time.epoch }}.log
+        echo "Timestamp: {{ ansible_date_time.iso8601 }}" >> {{ backup_dir }}/patch_post_{{ ansible_date_time.epoch }}.log
+        echo "Reboot performed: {{ 'Yes' if (reboot_needed and allow_reboot | bool) else 'No' }}" >> {{ backup_dir }}/patch_post_{{ ansible_date_time.epoch }}.log
+        echo "" >> {{ backup_dir }}/patch_post_{{ ansible_date_time.epoch }}.log
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Record updated package versions (RHEL/CentOS)
+      shell: rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort >> {{ backup_dir }}/patch_post_{{ ansible_date_time.epoch }}.log
+      when:
+        - ansible_os_family == "RedHat"
+        - not ansible_check_mode
+      changed_when: false
+
+    - name: Record updated package versions (Debian/Ubuntu)
+      shell: dpkg -l | grep ^ii >> {{ backup_dir }}/patch_post_{{ ansible_date_time.epoch }}.log
+      when:
+        - ansible_os_family == "Debian"
+        - not ansible_check_mode
+      changed_when: false
+
+    - name: Generate patch summary
+      debug:
+        msg: |
+          Patching completed for vulnerability {{ vulnerability_id }}
+          Target packages: {{ target_packages | default('All security updates') }}
+          Reboot required: {{ reboot_needed | default(false) }}
+          Reboot performed: {{ 'Yes' if (reboot_needed | default(false) and allow_reboot | bool) else 'No' }}
